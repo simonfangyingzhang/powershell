@@ -1,0 +1,182 @@
+Function New-KMServer {
+    <#    
+    .PARAMETER ServerIP
+        KM SeverIP to be registered
+    
+    .EXAMPLE
+        PowerCLI C:\> New-KMServer -ServerIP 192.168.10.10
+    #>
+    [CmdLetBinding()]
+
+    Param ( 
+        [Parameter(Mandatory=$True,ValueFromPipeline=$False,ValueFromPipelinebyPropertyName=$False)]
+        [String]$ServerIP,
+        [Parameter(Mandatory=$False,ValueFromPipeline=$False,ValueFromPipelinebyPropertyName=$False)] 
+        [String] $ServerName,
+        [Parameter(Mandatory=$False,ValueFromPipeline=$False,ValueFromPipelinebyPropertyName=$False)] 
+        [String] $ClusterID,        
+        [Parameter(Mandatory=$False,ValueFromPipeline=$False,ValueFromPipelinebyPropertyName=$False)] 
+        [String] $User,
+        [Parameter(Mandatory=$False,ValueFromPipeline=$False,ValueFromPipelinebyPropertyName=$False)] 
+        [String] $Password,        
+        [Parameter(Mandatory=$False,ValueFromPipeline=$False,ValueFromPipelinebyPropertyName=$False)] 
+        [Int] $Port
+    ) 
+    
+    Process {        
+        ### Get the cryptoManager of VC###
+        $SI = Get-View ServiceInstance                                                                                                                                                                            
+        $CM = Get-View $SI.Content.CryptoManager
+        if($CM -isnot [VMware.Vim.CryptoManager]){
+            Write-Error "no CryptoManager!"
+            return   
+        }
+        
+        if ($CM.kmipservers) {
+            if ($CM.kmipservers|foreach {$_.servers}|where {$_.Address -eq $ServerIP}) {
+                Write-Error "$serverIP registered already!"
+                return
+            }
+        }
+
+        ### Construct KMIPServerInfo
+
+        $kmipServerInfo = New-Object VMware.Vim.KmipServerInfo
+                        
+        $kmipServerInfo.Address = $ServerIP
+        if ($ServerName) {
+            $kmipServerInfo.Name = $ServerName
+        } else {
+            $kmipServerInfo.Name = $ServerIP
+        }
+        if ($User) {
+            $kmipServerInfo.UserName = $User
+        }
+        
+        if ($Port){
+            $kmipServerInfo.Port = $Port
+        } else {
+            $kmipServerInfo.Port =5696
+        } 
+            
+                     
+        ### Construct KMIPServerSpec
+        $kmipServerSpec = New-Object VMware.Vim.KmipServerSpec
+        $kmipServerSpec.Info = $kmipServerInfo
+
+        $providerID = New-Object VMware.Vim.KeyProviderId
+        if ($ClusterID){
+            $providerID.Id = $ClusterID
+            
+        } else {
+            $providerID.Id = $ServerIP
+        }
+        $kmipServerSpec.ClusterId = $providerID
+    
+        if ($Password){
+            $kmipServerSpec.Password = $Password
+        }      
+                        
+        Write-Verbose "Registering $ServerIP to VC..."
+        $CM.RegisterKmipServer($kmipServerSpec)
+        $CM.updateviewdata()
+        if (!($CM.kmipservers|where {($_.servers|foreach {$_.Address}) -contains $serverip})){
+            Write-Error "Registering $ServerIP failed!"
+            return
+        }
+
+        write-Verbose "Establishing Trust between $ServerIP and VC..."
+        $kmipServerCert = $CM.RetrieveKmipServerCert($providerID,$kmipServerInfo)
+        $CM.UploadKmipServerCert($providerID,$kmipServerCert.Certificate)
+
+        if (!($CM.KmipServers|where {$_.useasdefault})) {
+            write-verbose "no default KMServer yet, mark $serverIP default!"
+            $CM.MarkDefault($providerID)                
+        }
+        
+        write-verbose "return kmserver..."
+        $CM.updateviewdata()
+        $CM.kmipservers|where {($_.servers|foreach {$_.Address}) -contains $serverip}
+                   
+    } 
+}
+
+Function Set-VMStoragePolicy {
+    <#    
+    .PARAMETER VM
+        
+    .PARAMETER StoragePolicy
+        
+    .EXAMPLE
+        PowerCLI C:\> $vm=get-vm -name win2012-pvscsi
+        PowerCLI C:\> $sp=Get-SpbmStoragePolicy -name "VM Encryption Policy" ### the built-in sample storage policy for VMcrypt
+        PowerCLI C:\> $task=$vm|Set-VMStoragePolicy -StoragePolicy $sp
+        PowerCLI C:\> $task|Wait-Task
+
+    .EXAMPLE
+        PowerCLI C:\> $vm=get-vm -name win2012-pvscsi
+        PowerCLI C:\> $task=$vm|Set-VMStoragePolicy
+        PowerCLI C:\> $task|Wait-Task
+    .NOTES
+        Author: Simon Fangying Zhang
+        E-mail: fzhang@vmware.com
+
+    #>
+    [CmdLetBinding()]
+
+    Param ( 
+        [Parameter(Mandatory=$True,ValueFromPipeline=$True,ValueFromPipelinebyPropertyName=$True)]
+        [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine[]] $VM,
+        [Parameter(Mandatory=$False)] 
+        [PSObject] $StoragePolicy
+    ) 
+    
+    Process {
+        
+        if ($StoragePolicy) {
+            Write-Verbose "checking Storage Policy $StoragePolicy..."
+            if ($StoragePolicy -is [String]) {
+                $SP=get-spbmstoragepolicy $StoragePolicy
+                if ($SP -is [VMware.VimAutomation.Storage.Types.V1.Spbm.SpbmStoragePolicy]) {
+                    $StoragePolicy=$SP                
+                }else{
+                    Write-Error "Storage Policy $StoragePolicy invalid!"                
+                    return                
+                }                    
+            }
+
+            $profile=New-Object VMware.Vim.VirtualMachineDefinedProfileSpec
+            $profile.ProfileId=$StoragePolicy.Id
+
+        }else{
+            Write-Verbose "no Storage Policy!"
+            $profile=New-Object VMware.Vim.VirtualMachineEmptyProfileSpec   
+        }
+                            
+        foreach ($VMmachine in $VM) {
+            Write-Verbose "setting $VMmachine home..."
+            $spec = New-Object VMware.Vim.VirtualMachineConfigSpec        
+            $spec.VmProfile=$profile
+            $harddisks=$VMmachine|get-harddisk
+            if ($harddisks) {        
+                $devicechanges=@()        
+                Foreach ($harddisk in $harddisks) {        
+                    $deviceChange = New-Object VMware.Vim.VirtualDeviceConfigSpec        
+                    $deviceChange.operation = "edit"        
+                    $deviceChange.device=$harddisk.extensiondata
+                    Write-Verbose "setting $VMmachine $harddisk..."
+                    $deviceChange.Profile=$profile                
+                    $devicechanges += $deviceChange
+                }
+                $spec.deviceChange = $devicechanges
+            }
+            
+            $taskMoref=($vmmachine|Get-View).ReconfigVM_Task($spec)
+            Get-Task -Id "Task-$($taskMoref.value)"
+        }
+    } 
+}
+
+
+
+
