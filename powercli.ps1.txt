@@ -148,7 +148,7 @@ Function Set-VMStoragePolicy {
             $profile=New-Object VMware.Vim.VirtualMachineDefinedProfileSpec
             $profile.ProfileId=$StoragePolicy.Id
 
-        }else{
+        } else {
             Write-Verbose "no Storage Policy!"
             $profile=New-Object VMware.Vim.VirtualMachineEmptyProfileSpec   
         }
